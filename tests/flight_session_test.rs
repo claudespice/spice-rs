@@ -22,6 +22,7 @@ use arrow_flight::{
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
+use futures::future::join_all;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use prost::Message;
 use spiceai::{ClientBuilder, QueryParameters};
@@ -299,6 +300,13 @@ where
     rows
 }
 
+/// Runs `n` queries that all start before any of them finishes.
+async fn concurrent_queries(client: &spiceai::Client, n: usize) {
+    for result in join_all((0..n).map(|_| client.sql("SELECT 1"))).await {
+        assert_eq!(count_rows(result.expect("query")).await, 1);
+    }
+}
+
 fn seen(ledger: &Ledger, rpc: &str) -> Vec<Seen> {
     ledger
         .requests()
@@ -485,5 +493,49 @@ async fn a_fresh_session_the_runtime_refuses_is_not_renewed() {
         ledger.handshakes(),
         2,
         "the reused token is renewed once, and the renewed one is not"
+    );
+}
+
+/// Queries that start together must share the one handshake, not each pay for their
+/// own: the session is per client, so a client's first burst is where a handshake per
+/// query costs the most.
+#[tokio::test]
+async fn concurrent_first_queries_share_one_handshake() {
+    let (url, ledger) = start_server().await;
+    let client = client(&url, API_KEY).await;
+
+    concurrent_queries(&client, 5).await;
+
+    assert_eq!(
+        ledger.handshakes(),
+        1,
+        "five queries that start together must share one handshake"
+    );
+    let gets = seen(&ledger, "do_get");
+    assert_eq!(gets.len(), 5);
+    for get in gets {
+        assert_eq!(get.authorization.as_deref(), Some("Bearer session-1"));
+    }
+}
+
+/// An expired session is renewed once for the whole burst that finds it expired -- a
+/// handshake per rejected query would answer an hour of inactivity with a storm.
+#[tokio::test]
+async fn concurrent_queries_renew_an_expired_session_once() {
+    let (url, ledger) = start_server().await;
+    let client = client(&url, API_KEY).await;
+
+    let stream = client.sql("SELECT 1").await.expect("query");
+    assert_eq!(count_rows(stream).await, 1);
+    assert_eq!(ledger.handshakes(), 1);
+
+    ledger.expire_sessions();
+
+    concurrent_queries(&client, 5).await;
+
+    assert_eq!(
+        ledger.handshakes(),
+        2,
+        "the burst that found the session expired must renew it once between them"
     );
 }

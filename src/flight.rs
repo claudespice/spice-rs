@@ -32,7 +32,9 @@ use tonic::transport::Channel;
 /// What the runtime answered on the client's most recent handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Session {
-    /// No handshake has completed yet.
+    /// No handshake has completed yet -- or one is in flight, which a reader cannot
+    /// tell apart from here: `handshake_gate` is what distinguishes them, so a burst
+    /// must take it rather than act on `Pending` alone.
     Pending,
     /// A handshake completed. The runtime issues a bearer token when it authenticated
     /// the credential, and none when it runs without authentication.
@@ -58,6 +60,11 @@ pub struct SqlFlightClient {
     /// The session the runtime issued for `api_key`, shared by every clone of this
     /// client so a retry or a concurrent query reuses it rather than handshaking again.
     session: Arc<Mutex<Session>>,
+    /// Serializes the handshake itself, so a burst of queries that all find no session
+    /// shares one round trip rather than each opening its own. Take it before `session`
+    /// and never the other way round: it is held across the handshake, which is why it is
+    /// async, whereas `session` is only ever held to read or replace it.
+    handshake_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqlFlightClient {
@@ -87,6 +94,7 @@ impl SqlFlightClient {
             client: FlightServiceClient::new(chan),
             max_retries,
             session: Arc::new(Mutex::new(Session::Pending)),
+            handshake_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -135,6 +143,9 @@ impl SqlFlightClient {
             .clone()
     }
 
+    /// Call this under `handshake_gate`. Today `authenticate` is the only caller and
+    /// holds it; a second writer that does not would reinstate a handshake per query in
+    /// a burst, with nothing to fail on it.
     fn store_session(&self, token: Option<Arc<str>>) {
         *self.session.lock().unwrap_or_else(PoisonError::into_inner) = Session::Established(token);
     }
@@ -154,6 +165,13 @@ impl SqlFlightClient {
     /// The runtime answers the handshake with a session token and keeps that session
     /// for an hour of inactivity, so one handshake serves every query a client makes
     /// rather than each one paying a round trip of its own.
+    ///
+    /// Queries that start together share that handshake rather than each opening one:
+    /// reading `session` releases it before the round trip, so without `handshake_gate`
+    /// every query in a client's first burst would see `Pending` and handshake, and every
+    /// query in a burst that finds the session expired would renew it separately. A
+    /// handshake that *fails* is serialized by the same gate rather than retried in
+    /// parallel, which is the cost of the guarantee.
     async fn authenticate(&self) -> std::result::Result<Credential, GenericError> {
         let (username, password) = match &self.api_key {
             Some(api_key) => ("", api_key.as_ref()),
@@ -169,6 +187,18 @@ impl SqlFlightClient {
             return Ok(Credential {
                 token,
                 reused: true,
+            });
+        }
+
+        let _handshaking = self.handshake_gate.lock().await;
+
+        // Not `reused`: this token was issued while the call waited on the gate, so it
+        // cannot have expired, and renewing on its rejection would answer a credential
+        // the runtime refuses with a second handshake.
+        if let Session::Established(token) = self.cached_session() {
+            return Ok(Credential {
+                token,
+                reused: false,
             });
         }
 
